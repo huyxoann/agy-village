@@ -408,7 +408,15 @@ let watchedFiles = new Map();
 let subagentMap = new Map();
 let pendingSubagentRoles = [];
 
-function classifyRoleToAgent(role = "", prompt = "") {
+function classifyRoleToAgent(role = "", prompt = "", typeName = "") {
+  const tn = String(typeName).toLowerCase();
+  if (tn.includes("design-icon") || tn === "flutter-design-icon") return "design";
+  if (tn.includes("l10n") || tn === "flutter-l10n") return "l10n";
+  if (tn.includes("data-worker") || tn === "flutter-data-worker") return "data";
+  if (tn.includes("ui-worker") || tn === "flutter-ui-worker") return "ui";
+  if (tn.includes("qa-tester") || tn === "flutter-qa-tester") return "qa";
+  if (tn.includes("code-reviewer") || tn === "flutter-code-reviewer") return "reviewer";
+
   const text = `${role} ${prompt}`.toLowerCase();
   if (text.includes("figma-ui-test") || text.includes("ui qa") || text.includes("impeccable")) return "qa";
   if (text.includes("design") || text.includes("icon") || text.includes("painter") || text.includes("shape")) return "design";
@@ -522,16 +530,17 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
         try {
           subList = JSON.parse(args.Subagents);
         } catch {
-          subList = [{ Role: args.Role || "Subagent", Prompt: args.Prompt || "" }];
+          subList = [{ TypeName: args.TypeName || "", Role: args.Role || "Subagent", Prompt: args.Prompt || "" }];
         }
       } else {
-        subList = [{ Role: args.Role || "Subagent", Prompt: args.Prompt || "" }];
+        subList = [{ TypeName: args.TypeName || "", Role: args.Role || "Subagent", Prompt: args.Prompt || "" }];
       }
 
       for (const sub of subList) {
-        const roleStr = String(sub.Role || "").replace(/^"|"$/g, "");
+        const typeStr = String(sub.TypeName || "").replace(/^"|"$/g, "");
+        const roleStr = String(sub.Role || typeStr || "").replace(/^"|"$/g, "");
         const promptStr = String(sub.Prompt || "");
-        const targetAgent = classifyRoleToAgent(roleStr, promptStr);
+        const targetAgent = classifyRoleToAgent(roleStr, promptStr, typeStr);
         pendingSubagentRoles.push(targetAgent);
 
         if (!isInitialCatchup) {
