@@ -214,6 +214,7 @@ for (const def of AGENT_DEFS) {
     carryLabel: "",
     carryType: "doc", // "doc" | "bug" | "approve"
     waypoints: [],
+    deliveryQueue: [],
     onArrival: null,
     handoffTimer: 0,
     handoffTargetId: null,
@@ -227,6 +228,36 @@ let tickCount = 0;
 let demoMode = false;
 let demoTimer = null;
 let demoStep = 0;
+
+// ─── Pipeline Phase & HUD Metrics State ──────────────────────────────────────
+const PIPELINE_PHASES = [
+  { id: 1, label: "1.Grill-Me" },
+  { id: 2, label: "2.Spec&TDD" },
+  { id: 3, label: "3.Coding" },
+  { id: 4, label: "4.QA Loop" },
+  { id: 5, label: "5.Review" },
+];
+let currentPhase = 0; // 0 = Idle, 1..5 = Active workflow phase
+let sessionMetrics = {
+  totalTokens: 0,
+  totalSubagents: 0,
+  sessionStartMs: 0,
+  lastStepMs: 0,
+};
+let recentRootSessions = []; // [{ convId, filePath, mtimeMs }]
+let pinnedSessionIdx = -1; // -1 = AUTO follow latest, 0..N-1 = pinned session
+
+function formatTokenCount(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function advancePhase(phaseId) {
+  if (phaseId > currentPhase) {
+    currentPhase = phaseId;
+  }
+}
 
 function addLog(msg, color = FG.white) {
   const now = new Date();
@@ -253,38 +284,49 @@ function buildCorridorPath(startX, startY, endX, endY) {
   return pts;
 }
 
+function startDeliveryLeg(sender, item) {
+  const receiver = AGENTS[item.toId];
+  if (!receiver) return;
+  const meetX = receiver.deskX + 2;
+  const meetY = receiver.row === "top" ? CORRIDOR_Y - 2 : CORRIDOR_Y + 2;
+
+  sender.state = "walking_handoff";
+  sender.carryLabel = item.docLabel.slice(0, 12);
+  sender.carryType = item.carryType;
+  sender.handoffTargetId = item.toId;
+  sender.waypoints = buildCorridorPath(sender.x, sender.y, meetX, meetY);
+
+  sender.onArrival = () => {
+    sender.state = "handing_off";
+    sender.handoffTimer = 8; // ~0.65 seconds face-to-face exchange
+    sender.facing = sender.x <= receiver.x ? "right" : "left";
+    receiver.facing = sender.facing === "right" ? "left" : "right";
+    receiver.bubble = item.carryType === "bug" ? "😱 Fixing!" : "📥 Got it!";
+
+    if (typeof item.onDelivered === "function") {
+      item.onDelivered();
+    }
+  };
+}
+
 /**
  * Commands `fromId` agent to physically stand up from their desk, walk along
  * the hallway carrying `docLabel` to `toId`'s desk, hand it over face-to-face,
- * and then walk back to their own desk!
+ * and visit any queued stops in `deliveryQueue` before walking back to their desk!
  */
 function walkAndDeliverTask(fromId, toId, docLabel, carryType = "doc", onDelivered = null) {
   const sender = AGENTS[fromId];
   const receiver = AGENTS[toId];
   if (!sender || !receiver) return;
 
-  // Target spot right in front of receiver's desk
-  const meetX = receiver.deskX + 2;
-  const meetY = receiver.row === "top" ? CORRIDOR_Y - 2 : CORRIDOR_Y + 2;
-
-  sender.state = "walking_handoff";
-  sender.carryLabel = docLabel.slice(0, 12);
-  sender.carryType = carryType;
-  sender.handoffTargetId = toId;
-  sender.waypoints = buildCorridorPath(sender.x, sender.y, meetX, meetY);
-
-  sender.onArrival = () => {
-    // Face the receiver and do a face-to-face handoff pause!
-    sender.state = "handing_off";
-    sender.handoffTimer = 10; // ~0.8 seconds face-to-face exchange
-    sender.facing = sender.x <= receiver.x ? "right" : "left";
-    receiver.facing = sender.facing === "right" ? "left" : "right";
-    receiver.bubble = carryType === "bug" ? "😱 Fixing!" : "📥 Got it!";
-
-    if (typeof onDelivered === "function") {
-      onDelivered();
+  const item = { toId, docLabel, carryType, onDelivered };
+  if (sender.state === "walking_handoff" || sender.state === "handing_off") {
+    if (sender.deliveryQueue.length < 6) {
+      sender.deliveryQueue.push(item);
     }
-  };
+    return;
+  }
+  startDeliveryLeg(sender, item);
 }
 
 function sendAgentToWork(agentId, taskLabel) {
@@ -362,8 +404,14 @@ function updateAgentsPhysics() {
         if (target && target.bubble === "📥 Got it!") {
           target.bubble = `⚡ ${target.task}`;
         }
-        // Now walk back home to own desk!
-        sendAgentHomeIdle(a.id, "done", "Delivered ✓");
+        // Check if there are more stops in the multi-stop delivery queue!
+        if (a.deliveryQueue && a.deliveryQueue.length > 0) {
+          const nextItem = a.deliveryQueue.shift();
+          startDeliveryLeg(a, nextItem);
+        } else {
+          // Walk back home to own desk!
+          sendAgentHomeIdle(a.id, a.id === "orchestrator" ? "working" : "done", a.id === "orchestrator" ? "Coordinating" : "Delivered ✓");
+        }
       }
       continue;
     }
@@ -444,11 +492,8 @@ function isRootConversationTranscript(tPath) {
   }
 }
 
-function findLatestTranscript() {
-  let latestFile = null;
-  let latestMtime = 0;
-  let latestConvId = null;
-
+function discoverRootSessions() {
+  const sessions = [];
   for (const baseDir of BRAIN_DIRS) {
     if (!fs.existsSync(baseDir)) continue;
     let entries = [];
@@ -463,15 +508,25 @@ function findLatestTranscript() {
       const tPath = path.join(baseDir, entry.name, ".system_generated", "logs", "transcript.jsonl");
       try {
         const st = fs.statSync(tPath);
-        if (st.mtimeMs > latestMtime && isRootConversationTranscript(tPath)) {
-          latestMtime = st.mtimeMs;
-          latestFile = tPath;
-          latestConvId = entry.name;
+        if (isRootConversationTranscript(tPath)) {
+          sessions.push({ convId: entry.name, filePath: tPath, mtimeMs: st.mtimeMs });
         }
       } catch {}
     }
   }
-  return { convId: latestConvId, filePath: latestFile };
+  sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  recentRootSessions = sessions.slice(0, 8);
+  return recentRootSessions;
+}
+
+function findLatestTranscript() {
+  const list = discoverRootSessions();
+  if (list.length === 0) return { convId: null, filePath: null };
+  if (pinnedSessionIdx >= 0 && pinnedSessionIdx < list.length) {
+    return list[pinnedSessionIdx];
+  }
+  pinnedSessionIdx = -1;
+  return list[0];
 }
 
 function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
@@ -487,8 +542,23 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
   const content = typeof step.content === "string" ? step.content : "";
   const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
 
+  // Accumulate HUD token metrics
+  const inTok = Number(step.input_tokens || 0);
+  const outTok = Number(step.output_tokens || 0);
+  if (inTok > 0 || outTok > 0) {
+    sessionMetrics.totalTokens += inTok + outTok;
+  }
+  if (step.created_at) {
+    const tMs = Date.parse(step.created_at);
+    if (!Number.isNaN(tMs)) {
+      if (!sessionMetrics.sessionStartMs) sessionMetrics.sessionStartMs = tMs;
+      sessionMetrics.lastStepMs = Math.max(sessionMetrics.lastStepMs, tMs);
+    }
+  }
+
   if (type === "USER_INPUT" && ownerAgentId === "orchestrator") {
     const snippet = content.replace(/<[^>]+>/g, "").trim().slice(0, 16);
+    if (currentPhase === 0) advancePhase(1);
     sendAgentToWork("orchestrator", snippet || "Planning");
     if (!isInitialCatchup) addLog(`🧑 User request → Orchestrator started working at desk`, FG.cyan);
     return;
@@ -499,6 +569,9 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
     if (m && pendingSubagentRoles.length > 0) {
       const childId = m[1];
       const targetAgent = pendingSubagentRoles.shift();
+      if (!subagentMap.has(childId)) {
+        sessionMetrics.totalSubagents += 1;
+      }
       subagentMap.set(childId, targetAgent);
       for (const baseDir of BRAIN_DIRS) {
         const childPath = path.join(baseDir, childId, ".system_generated", "logs", "transcript.jsonl");
@@ -542,6 +615,7 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
     const args = tc.args || {};
 
     if (name === "ask_question") {
+      advancePhase(1);
       sendAgentToWork("orchestrator", "/grill-me Q&A");
       if (!isInitialCatchup) addLog(`💬 Orchestrator interviewing user (/grill-me)...`, FG.cyan);
     } else if (name === "invoke_subagent") {
@@ -563,15 +637,16 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
         const targetAgent = classifyRoleToAgent(roleStr, promptStr, typeStr);
         pendingSubagentRoles.push(targetAgent);
 
+        if (targetAgent === "reviewer") advancePhase(5);
+        else if (targetAgent === "qa") advancePhase(4);
+        else advancePhase(3);
+
         if (!isInitialCatchup) {
           addLog(`🚶 Orchestrator dispatches [${typeStr || roleStr}] → ${AGENTS[targetAgent].name}`, AGENTS[targetAgent].color);
-          // Immediately wake target agent so parallel spawns don't get dropped if Orchestrator is already walking
-          sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
-          if (AGENTS.orchestrator.state !== "walking_handoff" && AGENTS.orchestrator.state !== "handing_off") {
-            walkAndDeliverTask("orchestrator", targetAgent, roleStr || typeStr || "Spec Task", "doc", () => {
-              sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
-            });
-          }
+          // Multi-stop delivery queue handles sequential corridor visits automatically!
+          walkAndDeliverTask("orchestrator", targetAgent, roleStr || typeStr || "Spec Task", "doc", () => {
+            sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
+          });
         } else {
           sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
         }
@@ -586,6 +661,11 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
       const p = String(args.Path || args.TargetFile || "").replace(/^"|"$/g, "");
       const base = path.basename(p) || "code";
       let target = ownerAgentId;
+      if (p.includes("openspec/") || base === "proposal.md" || base === "tasks.md" || base === "tests.md") {
+        advancePhase(2);
+      } else if (p.includes("/domain/") || p.includes("/data/") || p.includes("/presentation/") || p.endsWith(".arb")) {
+        advancePhase(3);
+      }
       if (ownerAgentId === "orchestrator") {
         if (p.includes("/l10n/") || p.endsWith(".arb")) target = "l10n";
         else if (p.includes("icon") || p.includes("painter") || p.includes("/theme/")) target = "design";
@@ -613,9 +693,13 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
     } else if (name === "run_command") {
       const cmd = String(args.CommandLine || args.toolSummary || "").replace(/^"|"$/g, "");
       let target = ownerAgentId;
-      if (cmd.includes("flutter test") || cmd.includes("flutter analyze")) {
+      if (cmd.includes("openspec")) {
+        advancePhase(2);
+      } else if (cmd.includes("flutter test") || cmd.includes("flutter analyze")) {
+        advancePhase(4);
         target = ownerAgentId === "orchestrator" ? "qa" : ownerAgentId;
       } else if (cmd.includes("gen-l10n")) {
+        advancePhase(3);
         target = "l10n";
       }
       sendAgentToWork(target, cmd.slice(0, 14));
@@ -659,6 +743,8 @@ function pollTranscripts() {
     watchedFiles.clear();
     subagentMap.clear();
     pendingSubagentRoles = [];
+    currentPhase = 0;
+    sessionMetrics = { totalTokens: 0, totalSubagents: 0, sessionStartMs: 0, lastStepMs: 0 };
     // Reset all agents when switching to a different conversation
     for (const a of Object.values(AGENTS)) {
       a.x = a.deskX + 2;
@@ -668,10 +754,12 @@ function pollTranscripts() {
       a.bubble = "";
       a.carryLabel = "";
       a.waypoints = [];
+      a.deliveryQueue = [];
+      a.loops = 0;
       a.lastActiveAt = 0;
     }
     watchedFiles.set(currentTranscriptPath, { offset: 0, agentId: "orchestrator", convId: currentConvId });
-    addLog(`📡 Attached to live session ${currentConvId.slice(0, 8)}...`, FG.mint);
+    addLog(`📡 Attached to session ${currentConvId.slice(0, 8)}...`, FG.mint);
   }
 
   for (const [filePath, info] of watchedFiles.entries()) {
@@ -687,14 +775,19 @@ function pollTranscripts() {
         info.offset = st.size;
 
         const lines = buf.toString("utf-8").split("\n");
-        if (isInitial && info.agentId === "orchestrator") {
-          // Pre-scan earlier lines for subagent registrations so subagentMap knows all child IDs
+        if (isInitial) {
+          // Pre-scan earlier lines for token metrics, pipeline phase, and subagent registrations
           const earlyEnd = isTranscriptCurrentlyIdle(lines, st.mtimeMs)
             ? lines.length
             : Math.max(0, lines.length - 15);
           for (let i = 0; i < earlyEnd; i++) {
             const l = lines[i];
-            if (l.includes("invoke_subagent") || l.includes("Created the following subagent:")) {
+            if (
+              l.includes("invoke_subagent") ||
+              l.includes("Created the following subagent:") ||
+              l.includes("input_tokens") ||
+              l.includes("openspec")
+            ) {
               processTranscriptLine(l, info.agentId, true);
             }
           }
@@ -728,6 +821,7 @@ const DEMO_SCRIPT = [
   {
     delay: 100,
     action: () => {
+      currentPhase = 1;
       for (const a of Object.values(AGENTS)) {
         a.x = a.deskX + 2;
         a.y = a.deskY;
@@ -736,28 +830,32 @@ const DEMO_SCRIPT = [
         a.bubble = "";
         a.carryLabel = "";
         a.waypoints = [];
+        a.deliveryQueue = [];
         a.loops = 0;
       }
       // Put Design & Data Worker at the Coffee Lounge initially!
       sendAgentToLounge("design");
-      addLog("🎬 [DEMO] Phase 1: Orchestrator wakes up for /grill-me & locks Domain Contract", FG.cyan);
+      addLog("🎬 [DEMO] Phase 1–2: Orchestrator runs /grill-me, OpenSpec & locks Domain Contract", FG.cyan);
       sendAgentToWork("orchestrator", "domain/ spec");
     },
   },
   {
     delay: 2600,
     action: () => {
-      addLog("🚶 [DEMO] Orchestrator stands up & walks to Data Worker and UI Worker with Domain Spec!", FG.cyan);
+      currentPhase = 3;
+      addLog("🚶 [DEMO] Phase 3: Orchestrator walks desk-to-desk (Data → UI) handing out Domain Spec!", FG.cyan);
       walkAndDeliverTask("orchestrator", "data", "Domain Spec", "doc", () => {
         sendAgentToWork("data", "repo_impl.dart");
         sendAgentToWork("design", "CustomPainter");
         sendAgentToWork("l10n", "app_vi.arb");
+      });
+      walkAndDeliverTask("orchestrator", "ui", "UI Spec", "doc", () => {
         sendAgentToWork("ui", "feature_page");
       });
     },
   },
   {
-    delay: 3800,
+    delay: 4200,
     action: () => {
       addLog("🎨 [DEMO] Design & L10n finished! Walking down the hallway to deliver Icons & L10n to UI Worker!", FG.pink);
       walkAndDeliverTask("design", "ui", "AppIcons SVG", "doc", () => {
@@ -771,7 +869,8 @@ const DEMO_SCRIPT = [
   {
     delay: 4200,
     action: () => {
-      addLog("📦 [DEMO] Data Worker finished first! Walking over to Test & UI QA desk to hand off Data Layer!", FG.blue);
+      currentPhase = 4;
+      addLog("📦 [DEMO] Phase 4: Data Worker finished first! Walking over to Test & UI QA desk!", FG.blue);
       walkAndDeliverTask("data", "qa", "Data Layer", "doc", () => {
         sendAgentToWork("qa", "generate-test");
       });
@@ -808,7 +907,8 @@ const DEMO_SCRIPT = [
   {
     delay: 3800,
     action: () => {
-      addLog("✅ [DEMO] QA Passed 100%! QA walks over to Code Reviewer desk with verified build!", FG.green);
+      currentPhase = 5;
+      addLog("✅ [DEMO] Phase 5: QA Passed 100%! QA walks over to Code Reviewer desk with verified build!", FG.green);
       walkAndDeliverTask("qa", "reviewer", "QA Verified", "approve", () => {
         sendAgentToWork("reviewer", "3-Axis Review");
       });
@@ -1052,13 +1152,35 @@ function renderFrame() {
 
   // Convert Grid to ANSI Output
   const lines = [];
+  const sessionTag =
+    pinnedSessionIdx >= 0
+      ? `PIN ${pinnedSessionIdx + 1}/${recentRootSessions.length} (${currentConvId ? currentConvId.slice(0, 8) : "none"})`
+      : `AUTO (${currentConvId ? currentConvId.slice(0, 8) : "waiting"})`;
   const modeBadge = demoMode
-    ? `${FG.yellow}${BOLD}● SIMULATION DEMO MODE${RESET}`
-    : `${FG.green}${BOLD}● LIVE AGY CLI MONITOR${RESET} ${FG.gray}(${currentConvId ? currentConvId.slice(0, 8) : "waiting"})${RESET}`;
+    ? `${FG.yellow}${BOLD}● SIMULATION DEMO${RESET}`
+    : `${FG.green}${BOLD}● LIVE${RESET} ${FG.gray}${sessionTag}${RESET}`;
+
+  const activeWorkersCount = allAgents.filter(
+    (a) => a.state === "working" || a.state === "walking_handoff" || a.state === "handing_off"
+  ).length;
+  const totalLoopsCount = allAgents.reduce((acc, a) => acc + (a.loops || 0), 0);
+  const hudMetrics = `${FG.cyan}⚡Active:${activeWorkersCount}/7${RESET} ${FG.gray}│${RESET} ${FG.magenta}🤖Sub:${sessionMetrics.totalSubagents}${RESET} ${FG.gray}│${RESET} ${FG.red}↻Loops:${totalLoopsCount}${RESET} ${FG.gray}│${RESET} ${FG.yellow}🪙${formatTokenCount(sessionMetrics.totalTokens)}${RESET}`;
 
   lines.push(
-    ` ${BOLD}${FG.cyan}🏢 ANTIGRAVITY 2D AGENT OFFICE${RESET}  │  ${modeBadge}  │  ${FG.gray}[D] Demo  [R] Replay  [Q] Quit${RESET}`
+    ` ${BOLD}${FG.cyan}🏢 AGY 2D OFFICE${RESET} │ ${modeBadge} │ ${hudMetrics} │ ${FG.gray}[D]Demo [S]Session [R]Replay [Q]Quit${RESET}`
   );
+
+  // Render 5-Phase Workflow Pipeline Bar
+  const phaseSegments = PIPELINE_PHASES.map((p) => {
+    if (currentPhase > p.id) {
+      return `${FG.green}✓ ${p.label}${RESET}`;
+    }
+    if (currentPhase === p.id) {
+      return `${BOLD}${FG.yellow}▶ [${p.label}]${RESET}`;
+    }
+    return `${FG.gray}○ ${p.label}${RESET}`;
+  });
+  lines.push(` ${BOLD}${FG.white}Pipeline:${RESET} ` + phaseSegments.join(` ${FG.darkGray}──►${RESET} `));
 
   for (let y = 0; y < MAP_H; y++) {
     let rowStr = "";
@@ -1126,6 +1248,20 @@ if (process.stdin.isTTY) {
     } else if (str === "d" || str === "D") {
       if (demoMode) stopDemo();
       else startDemo();
+    } else if (str === "s" || str === "S") {
+      discoverRootSessions();
+      if (recentRootSessions.length > 0) {
+        pinnedSessionIdx = (pinnedSessionIdx + 1) % (recentRootSessions.length + 1);
+        if (pinnedSessionIdx === recentRootSessions.length) {
+          pinnedSessionIdx = -1;
+          addLog("📡 Session mode: AUTO (following newest active session)", FG.mint);
+        } else {
+          const picked = recentRootSessions[pinnedSessionIdx];
+          addLog(`📌 Pinned session ${pinnedSessionIdx + 1}/${recentRootSessions.length}: ${picked.convId.slice(0, 8)}`, FG.yellow);
+        }
+        currentTranscriptPath = null; // Force re-attach on next poll
+        pollTranscripts();
+      }
     } else if (str === "r" || str === "R") {
       if (currentTranscriptPath && watchedFiles.has(currentTranscriptPath)) {
         watchedFiles.get(currentTranscriptPath).offset = 0;
