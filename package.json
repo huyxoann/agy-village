@@ -1,0 +1,37 @@
+{
+  "name": "agy-village",
+  "version": "1.0.0",
+  "description": "Real-time 2D Terminal Agent Office visualizer for Google Antigravity (agy CLI) with walking full-body characters, horizontal desks, and task handoff animations.",
+  "type": "module",
+  "bin": {
+    "agy-village": "./bin/agy-village.mjs"
+  },
+  "files": [
+    "bin/"
+  ],
+  "scripts": {
+    "start": "node ./bin/agy-village.mjs",
+    "demo": "node ./bin/agy-village.mjs --demo",
+    "test": "node ./bin/agy-village.mjs --once --demo"
+  },
+  "keywords": [
+    "antigravity",
+    "agy",
+    "ai-agents",
+    "multi-agent",
+    "tui",
+    "terminal",
+    "visualizer",
+    "ascii-art",
+    "flutter"
+  ],
+  "author": "huyxoann",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/huyxoann/agy-village.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
