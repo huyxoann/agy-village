@@ -428,6 +428,22 @@ function classifyRoleToAgent(role = "", prompt = "", typeName = "") {
   return "data";
 }
 
+function isRootConversationTranscript(tPath) {
+  try {
+    const fd = fs.openSync(tPath, "r");
+    const buf = Buffer.alloc(512);
+    const bytesRead = fs.readSync(fd, buf, 0, 512, 0);
+    fs.closeSync(fd);
+    if (bytesRead <= 0) return false;
+    const firstChunk = buf.toString("utf-8", 0, bytesRead);
+    // Subagent transcripts always start with step_index:0 type:"SYSTEM_MESSAGE" from parent agent
+    if (firstChunk.includes('"type":"SYSTEM_MESSAGE"')) return false;
+    return firstChunk.includes('"type":"USER_INPUT"') || firstChunk.includes('"source":"USER_EXPLICIT"');
+  } catch {
+    return false;
+  }
+}
+
 function findLatestTranscript() {
   let latestFile = null;
   let latestMtime = 0;
@@ -443,10 +459,11 @@ function findLatestTranscript() {
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
+      if (subagentMap.has(entry.name)) continue;
       const tPath = path.join(baseDir, entry.name, ".system_generated", "logs", "transcript.jsonl");
       try {
         const st = fs.statSync(tPath);
-        if (st.mtimeMs > latestMtime && !subagentMap.has(entry.name)) {
+        if (st.mtimeMs > latestMtime && isRootConversationTranscript(tPath)) {
           latestMtime = st.mtimeMs;
           latestFile = tPath;
           latestConvId = entry.name;
@@ -497,18 +514,21 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
     const senderId = m ? m[1] : null;
     const fromAgent = (senderId && subagentMap.get(senderId)) || "qa";
     if (!isInitialCatchup) {
-      const isBug = /CHANGES_REQUIRED|FAIL|Critical|High|P0|P1/i.test(content);
+      const isBug = /CHANGES_REQUESTED|CHANGES_REQUIRED|FAIL|Critical|High|P0|P1/i.test(content);
       if (isBug && (fromAgent === "qa" || fromAgent === "reviewer")) {
-        const targetWorker = fromAgent === "qa" ? "ui" : "orchestrator";
+        const isDataIssue = /repository|datasource|dto|model|domain/i.test(content) && !/widget|cubit|page|figma/i.test(content);
+        const targetWorker = isDataIssue ? "data" : fromAgent === "qa" ? "ui" : "orchestrator";
         AGENTS[fromAgent].loops += 1;
         addLog(`🔄 ${AGENTS[fromAgent].name} walks over to ${AGENTS[targetWorker].name} with Bug Fix #${AGENTS[fromAgent].loops}!`, FG.red);
         walkAndDeliverTask(fromAgent, targetWorker, `Fix Loop#${AGENTS[fromAgent].loops}`, "bug", () => {
           sendAgentToWork(targetWorker, `Fix Loop#${AGENTS[fromAgent].loops}`);
+          sendAgentHomeIdle(fromAgent, "idle_desk", "Waiting fix");
         });
       } else {
         addLog(`🏃 ${AGENTS[fromAgent].name} finished & walks over to hand report to Orchestrator!`, FG.green);
         walkAndDeliverTask(fromAgent, "orchestrator", "Done Report", "approve", () => {
-          sendAgentToWork("orchestrator", "Merging work");
+          sendAgentHomeIdle(fromAgent, "done", "Completed ✓");
+          sendAgentToWork("orchestrator", "Next Phase");
         });
       }
     } else {
@@ -544,27 +564,52 @@ function processTranscriptLine(line, ownerAgentId, isInitialCatchup = false) {
         pendingSubagentRoles.push(targetAgent);
 
         if (!isInitialCatchup) {
-          addLog(`🚶 Orchestrator stands up & walks to ${AGENTS[targetAgent].name} to hand off [${roleStr || "Task"}]`, AGENTS[targetAgent].color);
-          walkAndDeliverTask("orchestrator", targetAgent, roleStr || "Spec Task", "doc", () => {
-            sendAgentToWork(targetAgent, roleStr || "Coding...");
-          });
+          addLog(`🚶 Orchestrator dispatches [${typeStr || roleStr}] → ${AGENTS[targetAgent].name}`, AGENTS[targetAgent].color);
+          // Immediately wake target agent so parallel spawns don't get dropped if Orchestrator is already walking
+          sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
+          if (AGENTS.orchestrator.state !== "walking_handoff" && AGENTS.orchestrator.state !== "handing_off") {
+            walkAndDeliverTask("orchestrator", targetAgent, roleStr || typeStr || "Spec Task", "doc", () => {
+              sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
+            });
+          }
         } else {
-          sendAgentToWork(targetAgent, roleStr || "Coding...");
+          sendAgentToWork(targetAgent, roleStr || typeStr || "Coding...");
         }
       }
-    } else if (name === "write_file" || name === "edit_file") {
-      const p = String(args.Path || "").replace(/^"|"$/g, "");
-      const base = path.basename(p);
+    } else if (
+      name === "write_file" ||
+      name === "edit_file" ||
+      name === "write_to_file" ||
+      name === "replace_file_content" ||
+      name === "multi_replace_file_content"
+    ) {
+      const p = String(args.Path || args.TargetFile || "").replace(/^"|"$/g, "");
+      const base = path.basename(p) || "code";
       let target = ownerAgentId;
       if (ownerAgentId === "orchestrator") {
         if (p.includes("/l10n/") || p.endsWith(".arb")) target = "l10n";
-        else if (p.includes("icon") || p.includes("painter")) target = "design";
+        else if (p.includes("icon") || p.includes("painter") || p.includes("/theme/")) target = "design";
         else if (p.includes("/data/")) target = "data";
         else if (p.includes("/presentation/")) target = "ui";
         else if (p.includes("test/")) target = "qa";
       }
       sendAgentToWork(target, base);
-      if (!isInitialCatchup) addLog(`⌨️  ${AGENTS[target].name} typing ${base} at desk`, AGENTS[target].color);
+      if (!isInitialCatchup) addLog(`⌨️  ${AGENTS[target].name} editing ${base} at desk`, AGENTS[target].color);
+    } else if (
+      name === "read_file" ||
+      name === "view_file" ||
+      name === "grep_search" ||
+      name === "find_by_name" ||
+      name === "list_dir"
+    ) {
+      const rawTarget = String(args.Path || args.AbsolutePath || args.Query || args.SearchPath || args.DirectoryPath || "").replace(/^"|"$/g, "");
+      const label = path.basename(rawTarget) || name;
+      sendAgentToWork(ownerAgentId, `🔍 ${label}`);
+    } else if (name === "call_mcp_tool") {
+      const toolName = String(args.ToolName || "MCP").replace(/^"|"$/g, "");
+      const target = ownerAgentId === "orchestrator" && toolName.includes("figma") ? "design" : ownerAgentId;
+      sendAgentToWork(target, `🎨 ${toolName}`);
+      if (!isInitialCatchup) addLog(`🎨 ${AGENTS[target].name} calling MCP: ${toolName}`, AGENTS[target].color);
     } else if (name === "run_command") {
       const cmd = String(args.CommandLine || args.toolSummary || "").replace(/^"|"$/g, "");
       let target = ownerAgentId;
@@ -642,6 +687,18 @@ function pollTranscripts() {
         info.offset = st.size;
 
         const lines = buf.toString("utf-8").split("\n");
+        if (isInitial && info.agentId === "orchestrator") {
+          // Pre-scan earlier lines for subagent registrations so subagentMap knows all child IDs
+          const earlyEnd = isTranscriptCurrentlyIdle(lines, st.mtimeMs)
+            ? lines.length
+            : Math.max(0, lines.length - 15);
+          for (let i = 0; i < earlyEnd; i++) {
+            const l = lines[i];
+            if (l.includes("invoke_subagent") || l.includes("Created the following subagent:")) {
+              processTranscriptLine(l, info.agentId, true);
+            }
+          }
+        }
         if (isInitial && isTranscriptCurrentlyIdle(lines, st.mtimeMs)) {
           // Session is already idle on initial attach — do not replay historical tool calls as active!
           for (const a of Object.values(AGENTS)) {
